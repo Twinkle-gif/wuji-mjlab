@@ -28,6 +28,7 @@ outputs/
 logs/
 wandb/
 checkpoints/
+tmp/
 
 # Worktrees
 .worktrees/
@@ -105,6 +106,10 @@ tests/debug/
 # src/wuji_mjlab/assets/datasets/grasp_objects/ locally (or set
 # WUJI_GRASP_OBJECT_ROOT to another path).
 src/wuji_mjlab/assets/datasets/grasp_objects/
+
+# GraspQP grasp data + colleague notes (large, local-only — not committed).
+meshdata_20/
+liuwen/
 
 .codex/
 

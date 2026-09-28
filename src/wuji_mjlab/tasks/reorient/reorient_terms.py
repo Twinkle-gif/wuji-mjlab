@@ -169,7 +169,7 @@ def build_reorient_observations(
         "robot_cfg": SceneEntityCfg(
           "robot",
           geom_names=(".*palm_.*", ".*finger.*_col"),
-          actuator_names=(".*",),
+          actuator_names=[".*"],
           joint_names=(".*",),
         ),
         "object_cfg": SceneEntityCfg(
@@ -292,7 +292,7 @@ def build_reorient_actions() -> dict[str, ActionTermCfg]:
   return {
     "joint_pos": mdp.JointPositionOffsetEMAActionCfg(
       entity_name="robot",
-      actuator_names=(".*",),
+      actuator_names=[".*"],
       action_scale=0.5,
       ema_alpha=0.5,
       warmup_time_s=0.4,
@@ -649,7 +649,7 @@ def build_reorient_metrics() -> dict[str, MetricsTermCfg]:
     ),
     "torque_saturation_ratio": MetricsTermCfg(
       func=mdp.torque_saturation_ratio,
-      params={"asset_cfg": SceneEntityCfg("robot", actuator_names=(".*",))},
+      params={"asset_cfg": SceneEntityCfg("robot", actuator_names=[".*"])},
     ),
     "joint_acceleration_rms": MetricsTermCfg(
       func=mdp.joint_acceleration_rms,
