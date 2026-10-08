@@ -11,6 +11,11 @@ from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import quat_error_magnitude
 
 from wuji_mjlab.tasks.reorient.mdp.event_impl.state import get_reorient_event_state
+from wuji_mjlab.tasks.reorient.mdp.grasp_geometry import (
+  OFFSET_PALM_LOCAL,
+  ROT_GRASPP_TO_MJCF,
+  mat_to_quat,
+)
 from wuji_mjlab.utils.reward_decorators import curriculum_scaled
 
 # ---------------------------------------------------------------------------
@@ -324,3 +329,163 @@ def drop_penalty_sparse(
 ) -> torch.Tensor:
   """Penalty when the referenced termination term triggers."""
   return env.termination_manager.get_term(term_name).float()
+
+
+# ---------------------------------------------------------------------------
+# torch quaternion helpers (wxyz convention) used by the AnyGrasp goal reward
+# ---------------------------------------------------------------------------
+def _quat_conj(q: torch.Tensor) -> torch.Tensor:
+  return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
+
+
+def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+  w1, x1, y1, z1 = q1.unbind(-1)
+  w2, x2, y2, z2 = q2.unbind(-1)
+  return torch.stack(
+    [
+      w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+      w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+      w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+      w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ],
+    dim=-1,
+  )
+
+
+def _quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+  qv = torch.cat([torch.zeros_like(v[..., :1]), v], dim=-1)
+  return _quat_mul(_quat_mul(q, qv), _quat_conj(q))[..., 1:]
+
+
+_QUAT_ROT_MJCF_T = torch.tensor(
+  mat_to_quat(ROT_GRASPP_TO_MJCF.T), dtype=torch.float32
+)
+_OFFSET_PALM_LOCAL_T = torch.tensor(OFFSET_PALM_LOCAL, dtype=torch.float32)
+
+
+def work_penalty(
+  env,
+  robot_cfg: SceneEntityCfg = _DEFAULT_ROBOT_CFG,
+) -> torch.Tensor:
+  """Penalize mechanical work ``|tau . q̇|`` (DexterityGen ``r_work``).
+
+  Discourages wasteful motion by penalising the product of applied joint torque
+  and joint velocity, summed over the hand joints.
+  """
+  robot: Entity = env.scene[robot_cfg.name]
+  torque = robot.data.qfrc_actuator[:, robot_cfg.joint_ids]
+  vel = robot.data.joint_vel[:, robot_cfg.joint_ids]
+  return torch.sum(torch.abs(torque * vel), dim=-1)
+
+
+_FINGERTIP_BODY_PATTERN = r".*_finger[1-5]_link4"
+
+
+def _fingertip_body_ids(robot: Entity) -> list[int]:
+  """Entity-local indices of the five fingertip bodies (``right_finger{1..5}_link4``)."""
+  ids, _ = robot.find_bodies(_FINGERTIP_BODY_PATTERN)
+  return ids
+
+
+def fingertip_velocity_penalty(
+  env,
+  robot_cfg: SceneEntityCfg = _DEFAULT_ROBOT_CFG,
+) -> torch.Tensor:
+  """Penalize fingertip linear speed to encourage a stable, non-slipping grasp.
+
+  DexterityGen regularizes fingertip motion; a calm hand keeps the object from
+  slipping. Returns ``sum ||v_tip||^2`` over the five fingertips.
+  """
+  robot: Entity = env.scene[robot_cfg.name]
+  vel = robot.data.body_link_lin_vel_w[:, _fingertip_body_ids(robot)]  # (num_envs, 5, 3)
+  return torch.sum(torch.norm(vel, dim=-1) ** 2, dim=-1)
+
+
+def grasp_contact_reward(
+  env,
+  command_name: str = "anygrasp_command",
+  robot_cfg: SceneEntityCfg = _DEFAULT_ROBOT_CFG,
+  object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+  lambda_contact: float = 10.0,
+) -> torch.Tensor:
+  """DexterityGen-style contact-point matching.
+
+  Each fingertip is matched to *its own* target contact point (the average of
+  the goal grasp's recorded contact points on that fingertip, via
+  ``fingertip_info["nearest_pts"]`` + ``contact_idx``)::
+
+      r = exp(-lambda_contact * sum_i mask_i ||p_i - c_i||^2)
+
+  where ``p_i`` is fingertip ``i``'s position in the object frame and ``c_i`` is
+  its target contact point. Fingertips without a recorded contact (``mask_i=0``)
+  are excluded.
+  """
+  cmd = env.command_manager.get_term(command_name)
+  robot: Entity = env.scene[robot_cfg.name]
+  obj: Entity = env.scene[object_cfg.name]
+
+  cur = robot.data.body_link_pos_w[:, _fingertip_body_ids(robot)]  # (num_envs, 5, 3)
+  obj_pos = obj.data.root_link_pos_w
+  obj_quat = obj.data.root_link_quat_w.unsqueeze(1)  # (num_envs, 1, 4) for broadcasting
+  rel = _quat_rotate(_quat_conj(obj_quat), cur - obj_pos.unsqueeze(1))  # (num_envs, 5, 3)
+
+  target = cmd.goal_fingertip_target  # (num_envs, 5, 3)
+  mask = cmd.goal_fingertip_mask  # (num_envs, 5)
+  err = torch.norm(rel - target, dim=-1) * mask  # (num_envs, 5)
+  return torch.exp(-lambda_contact * torch.sum(err**2, dim=-1))
+
+
+def grasp_goal_reward(
+  env,
+  command_name: str = "anygrasp_command",
+  robot_cfg: SceneEntityCfg = _DEFAULT_ROBOT_CFG,
+  object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+  lambda_joint: float = 2.0,
+  lambda_pose: float = 2.0,
+) -> torch.Tensor:
+  """DexterityGen-style goal reward for AnyGrasp-to-AnyGrasp.
+
+  Matches both parts of a grasp against a sampled target: the joint angles and
+  the relative hand pose (``root_pose`` in the GraspQP object frame)::
+
+      r = exp(-lambda_joint * ||q - q_goal||^2)
+        * exp(-lambda_pose  * (||p - p_goal||^2 + d(R, R_goal)^2))
+
+  The goal comes from :class:`~wuji_mjlab.tasks.reorient.mdp.grasp_goal_command.GraspGoalCommand`.
+  """
+  cmd = env.command_manager.get_term(command_name)
+  robot: Entity = env.scene[robot_cfg.name]
+  obj: Entity = env.scene[object_cfg.name]
+
+  # -- joint match ---------------------------------------------------------
+  joint_pos = robot.data.joint_pos[:, robot_cfg.joint_ids]
+  soft = robot.data.soft_joint_pos_limits[:, robot_cfg.joint_ids]
+  center = 0.5 * (soft[..., 0] + soft[..., 1])
+  half = 0.5 * (soft[..., 1] - soft[..., 0])
+  q_norm = ((joint_pos - center) / (half + 1e-6)).clamp(-1.0, 1.0)
+  joint_err = torch.norm(q_norm - cmd.goal_joints_norm, dim=-1)
+  r_joint = torch.exp(-lambda_joint * joint_err**2)
+
+  # -- relative hand pose (root_pose convention) ---------------------------
+  palm_pos = robot.data.root_link_pos_w
+  palm_quat = robot.data.root_link_quat_w
+  obj_pos = obj.data.root_link_pos_w
+  obj_quat = obj.data.root_link_quat_w
+
+  # hand in object frame (MJCF palm frame)
+  rel_pos = _quat_rotate(_quat_conj(obj_quat), palm_pos - obj_pos)
+  rel_quat = _quat_mul(_quat_conj(obj_quat), palm_quat)
+  # MJCF palm frame -> GraspQP root_pose convention
+  quat_graspp = _quat_mul(rel_quat, _QUAT_ROT_MJCF_T.to(rel_quat.device))
+  pos_graspp = rel_pos - _quat_rotate(quat_graspp, _OFFSET_PALM_LOCAL_T.to(rel_pos.device))
+
+  p_goal = cmd.goal_root_pose[:, :3]
+  q_goal = cmd.goal_root_pose[:, 3:]
+  pos_err = torch.norm(pos_graspp - p_goal, dim=-1)
+  dot = torch.abs(torch.sum(quat_graspp * q_goal, dim=-1)).clamp(0.0, 1.0)
+  orn_err = 2.0 * torch.acos(dot)
+  r_pose = torch.exp(-lambda_pose * (pos_err**2 + orn_err**2))
+
+  return r_joint * r_pose
+
+

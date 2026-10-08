@@ -12,6 +12,7 @@ from .event_impl.episode import (
   reset_joint_acc_cache,
   reset_object_orientation,
 )
+from .event_impl.grasp_reset import reset_to_random_grasp
 from .event_impl.joint_reset import (
   num_selected_bodies,
   reset_joints_within_limits_range,
@@ -45,6 +46,7 @@ __all__ = [
   "reset_joint_acc_cache",
   "reset_joints_within_limits_range",
   "reset_object_orientation",
+  "reset_to_random_grasp",
   "resolve_joint_velocity_limits",
   "resolve_random_bounds",
   "sample_and_clip",
